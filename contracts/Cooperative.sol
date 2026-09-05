@@ -3,25 +3,11 @@ pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/**
- * @title Cooperative
- * @notice Core contract: membership, admin hierarchy, savings, and lending.
- * @dev Produce registration and escrow sales live in a separate
- *      ProduceMarketplace contract (see ProduceMarketplace.sol) to keep
- *      this contract under Ethereum's 24KB contract size limit.
- *      ProduceMarketplace is granted limited write access via the
- *      onlyMarketplace modifier - it can credit sale proceeds to a
- *      farmer's balance, but cannot touch anything else.
- */
 contract Cooperative {
-
-    // ============ ENUMS ============
 
     enum Role { None, Admin, Farmer, Buyer }
     enum MemberStatus { Unregistered, Pending, Active, Trusted }
     enum LoanStatus { None, Pending, Approved, Rejected, Repaid }
-
-    // ============ STRUCTS ============
 
     struct Member {
         address memberAddress;
@@ -47,13 +33,17 @@ contract Cooperative {
         uint256 repaymentTimestamp;
     }
 
-    // ============ STATE VARIABLES ============
+    struct JoinRequest {
+        address requester;
+        Role requestedRole;
+        uint256 requestTimestamp;
+        bool exists;
+    }
 
     IERC20 public usdcToken;
     address public superAdmin;
     uint256 public adminCount;
 
-    /// @notice The single ProduceMarketplace contract allowed to credit sale proceeds
     address public produceMarketplace;
 
     mapping(address => Member) public members;
@@ -61,6 +51,10 @@ contract Cooperative {
     uint256 public loanCounter;
 
     uint256 public minimumDeposit;
+
+    mapping(address => JoinRequest) public joinRequests;
+    address[] public pendingRequestAddresses;
+    mapping(address => uint256) private pendingRequestIndex;
 
     uint256 public constant ACTIVE_LOAN_MULTIPLIER = 2;
     uint256 public constant TRUSTED_LOAN_MULTIPLIER = 3;
@@ -75,10 +69,9 @@ contract Cooperative {
     uint256 public constant LATE_PENALTY_PER_MONTH = 2;
     uint256 public constant SECONDS_PER_MONTH = 30 days;
 
-    // ============ EVENTS ============
-
     event MemberOnboarded(address indexed memberAddress, Role role, uint256 timestamp);
     event StatusUpgraded(address indexed memberAddress, MemberStatus newStatus);
+    event StatusDowngraded(address indexed memberAddress, MemberStatus newStatus);
     event DepositMade(address indexed member, uint256 amount, uint256 newBalance);
     event WithdrawalMade(address indexed member, uint256 amount, uint256 newBalance);
     event LoanApplied(uint256 indexed loanId, address indexed applicant, uint256 amount, uint256 durationMonths);
@@ -89,13 +82,13 @@ contract Cooperative {
     event AdminRemoved(address indexed removedAdmin, address indexed removedBy);
     event SuperAdminTransferred(address indexed previousSuperAdmin, address indexed newSuperAdmin);
 
-    /// @notice Emitted when the ProduceMarketplace contract address is set/updated
     event MarketplaceSet(address indexed marketplace, address indexed setBy);
-
-    /// @notice Emitted when sale proceeds are credited to a farmer by the marketplace
     event SaleProceedsCredited(address indexed farmer, uint256 amount);
 
-    // ============ MODIFIERS ============
+    event JoinRequested(address indexed requester, Role requestedRole, uint256 timestamp);
+    event JoinRequestApproved(address indexed requester, address indexed approvedBy);
+    event JoinRequestRejected(address indexed requester, address indexed rejectedBy);
+    event MemberRemoved(address indexed memberAddress, Role previousRole, address indexed removedBy);
 
     modifier onlyAdmin() {
         require(members[msg.sender].role == Role.Admin, "Not authorized: Admin only");
@@ -121,13 +114,10 @@ contract Cooperative {
         _;
     }
 
-    /// @dev Restricts a function so only the registered ProduceMarketplace contract can call it
     modifier onlyMarketplace() {
         require(msg.sender == produceMarketplace, "Not authorized: Marketplace only");
         _;
     }
-
-    // ============ CONSTRUCTOR ============
 
     constructor(address _usdcAddress, uint256 _minimumDeposit) {
         superAdmin = msg.sender;
@@ -150,30 +140,12 @@ contract Cooperative {
         emit MemberOnboarded(msg.sender, Role.Admin, block.timestamp);
     }
 
-    // ============ MARKETPLACE WIRING (Super Admin only) ============
-
-    /**
-     * @notice Registers the ProduceMarketplace contract allowed to credit
-     *         sale proceeds to farmers. Must be set after both contracts
-     *         are deployed.
-     * @param _marketplace Address of the deployed ProduceMarketplace contract
-     */
     function setProduceMarketplace(address _marketplace) external onlySuperAdmin {
         require(_marketplace != address(0), "Invalid address");
         produceMarketplace = _marketplace;
         emit MarketplaceSet(_marketplace, msg.sender);
     }
 
-    /**
-     * @notice Called by ProduceMarketplace after a completed sale to credit
-     *         the farmer's withdrawable balance and record the sale toward
-     *         their Trusted-tier progress.
-     * @dev The marketplace must have already transferred the corresponding
-     *      USDC into this contract before calling this - this function only
-     *      updates internal accounting, it does not move funds itself.
-     * @param _farmer The farmer to credit
-     * @param _amount The farmer's payout amount, in raw USDC units
-     */
     function creditSaleProceeds(address _farmer, uint256 _amount) external onlyMarketplace {
         require(members[_farmer].role == Role.Farmer, "Not a registered farmer");
 
@@ -188,8 +160,6 @@ contract Cooperative {
 
         emit SaleProceedsCredited(_farmer, _amount);
     }
-
-    // ============ ADMIN MANAGEMENT (Super Admin only) ============
 
     function addAdmin(address _newAdmin) external onlySuperAdmin {
         require(_newAdmin != address(0), "Invalid address");
@@ -235,9 +205,15 @@ contract Cooperative {
         emit SuperAdminTransferred(previousSuperAdmin, _newSuperAdmin);
     }
 
-    // ============ MEMBER ONBOARDING ============
-
     function onboardFarmer(address _farmerAddress) external onlyAdmin {
+        _onboardFarmer(_farmerAddress);
+    }
+
+    function onboardBuyer(address _buyerAddress) external onlyAdmin {
+        _onboardBuyer(_buyerAddress);
+    }
+
+    function _onboardFarmer(address _farmerAddress) internal {
         require(_farmerAddress != address(0), "Invalid address");
         require(members[_farmerAddress].role == Role.None, "Already a member");
 
@@ -255,7 +231,7 @@ contract Cooperative {
         emit MemberOnboarded(_farmerAddress, Role.Farmer, block.timestamp);
     }
 
-    function onboardBuyer(address _buyerAddress) external onlyAdmin {
+    function _onboardBuyer(address _buyerAddress) internal {
         require(_buyerAddress != address(0), "Invalid address");
         require(members[_buyerAddress].role == Role.None, "Already a member");
 
@@ -273,7 +249,82 @@ contract Cooperative {
         emit MemberOnboarded(_buyerAddress, Role.Buyer, block.timestamp);
     }
 
-    // ============ DEPOSITS & WITHDRAWALS (USDC) ============
+    function requestToJoin(Role _requestedRole) external {
+        require(members[msg.sender].role == Role.None, "Already a member");
+        require(_requestedRole == Role.Farmer || _requestedRole == Role.Buyer, "Invalid role");
+        require(!joinRequests[msg.sender].exists, "Request already pending");
+
+        joinRequests[msg.sender] = JoinRequest({
+            requester: msg.sender,
+            requestedRole: _requestedRole,
+            requestTimestamp: block.timestamp,
+            exists: true
+        });
+
+        pendingRequestIndex[msg.sender] = pendingRequestAddresses.length;
+        pendingRequestAddresses.push(msg.sender);
+
+        emit JoinRequested(msg.sender, _requestedRole, block.timestamp);
+    }
+
+    function _clearJoinRequest(address _requester) internal {
+        uint256 index = pendingRequestIndex[_requester];
+        uint256 lastIndex = pendingRequestAddresses.length - 1;
+
+        if (index != lastIndex) {
+            address lastAddress = pendingRequestAddresses[lastIndex];
+            pendingRequestAddresses[index] = lastAddress;
+            pendingRequestIndex[lastAddress] = index;
+        }
+
+        pendingRequestAddresses.pop();
+        delete pendingRequestIndex[_requester];
+        delete joinRequests[_requester];
+    }
+
+    function approveJoinRequest(address _requester) external onlyAdmin {
+        require(joinRequests[_requester].exists, "No pending request");
+        Role requestedRole = joinRequests[_requester].requestedRole;
+
+        _clearJoinRequest(_requester);
+
+        if (requestedRole == Role.Farmer) {
+            _onboardFarmer(_requester);
+        } else {
+            _onboardBuyer(_requester);
+        }
+
+        emit JoinRequestApproved(_requester, msg.sender);
+    }
+
+    function rejectJoinRequest(address _requester) external onlyAdmin {
+        require(joinRequests[_requester].exists, "No pending request");
+        _clearJoinRequest(_requester);
+        emit JoinRequestRejected(_requester, msg.sender);
+    }
+
+    function getPendingRequests() external view returns (JoinRequest[] memory) {
+        JoinRequest[] memory requests = new JoinRequest[](pendingRequestAddresses.length);
+        for (uint256 i = 0; i < pendingRequestAddresses.length; i++) {
+            requests[i] = joinRequests[pendingRequestAddresses[i]];
+        }
+        return requests;
+    }
+
+    function removeMember(address _memberAddress) external onlyAdmin {
+        Member storage member = members[_memberAddress];
+        require(
+            member.role == Role.Farmer || member.role == Role.Buyer,
+            "Can only remove Farmer or Buyer members"
+        );
+        require(member.currentBalance == 0, "Member must withdraw their balance first");
+        require(member.activeLoanId == 0, "Member has an active loan - must be repaid first");
+
+        Role previousRole = member.role;
+        delete members[_memberAddress];
+
+        emit MemberRemoved(_memberAddress, previousRole, msg.sender);
+    }
 
     function deposit(uint256 _amount) external {
         require(members[msg.sender].role != Role.None, "Not a registered member");
@@ -306,9 +357,12 @@ contract Cooperative {
         require(success, "Withdrawal transfer failed");
 
         emit WithdrawalMade(msg.sender, _amount, member.currentBalance);
-    }
 
-    // ============ LOANS ============
+        if (member.status == MemberStatus.Active && member.currentBalance < minimumDeposit) {
+            member.status = MemberStatus.Pending;
+            emit StatusDowngraded(msg.sender, MemberStatus.Pending);
+        }
+    }
 
     function applyForLoan(uint256 _amount, uint256 _durationMonths) external onlyFarmer onlyActiveOrTrusted {
         require(_amount > 0, "Loan amount must be greater than 0");
@@ -394,8 +448,6 @@ contract Cooperative {
         emit LoanRepaid(_loanId, msg.sender, totalOwed, penalty);
     }
 
-    // ============ INTERNAL LOGIC ============
-
     function _calculateMaxLoan(address _member) internal view returns (uint256) {
         Member storage member = members[_member];
 
@@ -424,8 +476,6 @@ contract Cooperative {
 
         return (baseTotal + penalty, penalty);
     }
-
-    // ============ VIEW FUNCTIONS ============
 
     function getMember(address _member) external view returns (Member memory) {
         return members[_member];

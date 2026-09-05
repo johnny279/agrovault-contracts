@@ -205,4 +205,196 @@ describe("Cooperative + ProduceMarketplace", function () {
     const maxLoan = await cooperative.getMaxLoanAmount(farmer.address);
     expect(maxLoan).to.equal(expectedCap);
   });
+    // ============ REQUEST TO JOIN ============
+
+  it("should let an unregistered address request to join as a Farmer", async function () {
+    await cooperative.connect(randomUser).requestToJoin(2); // Role.Farmer
+
+    const request = await cooperative.joinRequests(randomUser.address);
+    expect(request.exists).to.equal(true);
+    expect(request.requestedRole).to.equal(2); // Farmer
+  });
+
+  it("should NOT let an existing member request to join", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+
+    await expect(
+      cooperative.connect(farmer).requestToJoin(2)
+    ).to.be.revertedWith("Already a member");
+  });
+
+  it("should NOT let the same address submit two pending requests", async function () {
+    await cooperative.connect(randomUser).requestToJoin(2); // Farmer
+
+    await expect(
+      cooperative.connect(randomUser).requestToJoin(3) // Buyer
+    ).to.be.revertedWith("Request already pending");
+  });
+
+  it("should NOT allow requesting the Admin or None role", async function () {
+    await expect(
+      cooperative.connect(randomUser).requestToJoin(1) // Role.Admin
+    ).to.be.revertedWith("Invalid role");
+  });
+
+  it("should let an admin approve a join request, onboarding the requester", async function () {
+    await cooperative.connect(randomUser).requestToJoin(2); // Farmer
+    await cooperative.approveJoinRequest(randomUser.address);
+
+    const memberData = await cooperative.getMember(randomUser.address);
+    expect(memberData.role).to.equal(2); // Farmer
+    expect(memberData.status).to.equal(1); // Pending
+
+    const request = await cooperative.joinRequests(randomUser.address);
+    expect(request.exists).to.equal(false);
+  });
+
+  it("should let an admin reject a join request without onboarding", async function () {
+    await cooperative.connect(randomUser).requestToJoin(3); // Buyer
+    await cooperative.rejectJoinRequest(randomUser.address);
+
+    const memberData = await cooperative.getMember(randomUser.address);
+    expect(memberData.role).to.equal(0); // Role.None
+
+    const request = await cooperative.joinRequests(randomUser.address);
+    expect(request.exists).to.equal(false);
+  });
+
+  it("should NOT let a non-admin approve or reject a join request", async function () {
+    await cooperative.connect(randomUser).requestToJoin(2);
+
+    await expect(
+      cooperative.connect(buyer).approveJoinRequest(randomUser.address)
+    ).to.be.revertedWith("Not authorized: Admin only");
+  });
+
+  it("should keep the pending list consistent after approving a middle request", async function () {
+    // Three separate wallets request to join
+    await cooperative.connect(randomUser).requestToJoin(2);
+    await cooperative.connect(farmer).requestToJoin(2);
+    await cooperative.connect(buyer).requestToJoin(3);
+
+    // Approve the middle one - this exercises the swap-and-pop logic
+    await cooperative.approveJoinRequest(farmer.address);
+
+    const remaining = await cooperative.getPendingRequests();
+    expect(remaining.length).to.equal(2);
+
+    const remainingAddresses = remaining.map((r) => r.requester);
+    expect(remainingAddresses).to.include(randomUser.address);
+    expect(remainingAddresses).to.include(buyer.address);
+    expect(remainingAddresses).to.not.include(farmer.address);
+  });
+
+  // ============ WITHDRAWAL STATUS DOWNGRADE ============
+
+  it("should downgrade an Active member back to Pending if balance drops below minimumDeposit", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+    await usdc.connect(farmer).approve(cooperative.target, 15 * 10**6);
+    await cooperative.connect(farmer).deposit(15 * 10**6);
+
+    let farmerData = await cooperative.getMember(farmer.address);
+    expect(farmerData.status).to.equal(2); // Active
+
+    // Withdraw enough to drop below the 10 USDC minimum
+    await cooperative.connect(farmer).withdraw(10 * 10**6);
+
+    farmerData = await cooperative.getMember(farmer.address);
+    expect(farmerData.currentBalance).to.equal(5 * 10**6);
+    expect(farmerData.status).to.equal(1); // Pending
+  });
+
+  it("should emit StatusDowngraded when balance drops below minimumDeposit", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+    await usdc.connect(farmer).approve(cooperative.target, 15 * 10**6);
+    await cooperative.connect(farmer).deposit(15 * 10**6);
+
+    await expect(cooperative.connect(farmer).withdraw(10 * 10**6))
+      .to.emit(cooperative, "StatusDowngraded")
+      .withArgs(farmer.address, 1); // MemberStatus.Pending
+  });
+
+  it("should NOT downgrade if balance stays at or above minimumDeposit", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+    await usdc.connect(farmer).approve(cooperative.target, 20 * 10**6);
+    await cooperative.connect(farmer).deposit(20 * 10**6);
+
+    await cooperative.connect(farmer).withdraw(5 * 10**6); // still 15 left, above 10 minimum
+
+    const farmerData = await cooperative.getMember(farmer.address);
+    expect(farmerData.status).to.equal(2); // still Active
+  });
+
+  it("should NOT downgrade a Trusted member on withdrawal (only Active is checked)", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+    await cooperative.onboardBuyer(buyer.address);
+
+    await usdc.connect(farmer).approve(cooperative.target, 15 * 10**6);
+    await cooperative.connect(farmer).deposit(15 * 10**6);
+
+    await marketplace.connect(farmer).logProduce("Maize", 500, 100 * 10**6);
+    await marketplace.approveBatch(1);
+    await usdc.mint(buyer.address, 100 * 10**6);
+    await usdc.connect(buyer).approve(marketplace.target, 100 * 10**6);
+    await marketplace.connect(buyer).purchaseBatch(1);
+
+    let farmerData = await cooperative.getMember(farmer.address);
+    expect(farmerData.status).to.equal(3); // Trusted after first sale
+
+    // Withdraw almost everything, well below minimumDeposit
+    await cooperative.connect(farmer).withdraw(farmerData.currentBalance - 1n);
+
+    farmerData = await cooperative.getMember(farmer.address);
+    expect(farmerData.status).to.equal(3); // still Trusted - downgrade only applies to Active
+  });
+
+  // ============ REMOVE MEMBER ============
+
+  it("should let an admin remove a Farmer with zero balance and no active loan", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+    await cooperative.removeMember(farmer.address);
+
+    const farmerData = await cooperative.getMember(farmer.address);
+    expect(farmerData.role).to.equal(0); // Role.None
+  });
+
+  it("should NOT let an admin remove a member with a nonzero balance", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+    await usdc.connect(farmer).approve(cooperative.target, 15 * 10**6);
+    await cooperative.connect(farmer).deposit(15 * 10**6);
+
+    await expect(
+      cooperative.removeMember(farmer.address)
+    ).to.be.revertedWith("Member must withdraw their balance first");
+  });
+
+  it("should NOT let an admin remove a member with an active loan", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+    await usdc.connect(farmer).approve(cooperative.target, 30 * 10**6);
+    await cooperative.connect(farmer).deposit(30 * 10**6);
+    await usdc.mint(cooperative.target, 500 * 10**6);
+    await cooperative.connect(farmer).applyForLoan(15 * 10**6, 3);
+
+    // Withdraw the deposit back down to zero so only the loan blocks removal
+    const farmerData = await cooperative.getMember(farmer.address);
+    await cooperative.connect(farmer).withdraw(farmerData.currentBalance);
+
+    await expect(
+      cooperative.removeMember(farmer.address)
+    ).to.be.revertedWith("Member has an active loan - must be repaid first");
+  });
+
+  it("should NOT let removeMember target an Admin", async function () {
+    await expect(
+      cooperative.removeMember(admin.address)
+    ).to.be.revertedWith("Can only remove Farmer or Buyer members");
+  });
+
+  it("should NOT let a non-admin call removeMember", async function () {
+    await cooperative.onboardFarmer(farmer.address);
+
+    await expect(
+      cooperative.connect(randomUser).removeMember(farmer.address)
+    ).to.be.revertedWith("Not authorized: Admin only");
+  });
 });
